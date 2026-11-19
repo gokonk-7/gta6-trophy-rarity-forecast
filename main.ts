@@ -337,7 +337,7 @@ function main(): void {
   const names = fs.readdirSync(inputDir).filter((n) => n.endsWith(".in")).sort();
   for (const name of names) {
     const raw = fs.readFileSync(path.join(inputDir, name), "utf8");
-    const kase = JSON.parse(raw) as CaseFile;
+    const kase: CaseFile = JSON.parse(raw);
     const out = forecastCase(kase);
     const outName = name.slice(0, -3) + ".out";
     fs.writeFileSync(path.join(outputDir, outName), JSON.stringify(out));
