@@ -317,9 +317,7 @@ function forecastCase(kase: CaseFile): { trophies: { id: number; q: number[] }[]
     const q: number[] = [];
     for (const z of Z) {
       const v = logistic(medLogit + z * s);
-      let rounded = Math.round(v * 10000) / 10000;
-      if (rounded < 0.01) rounded = 0.01;
-      if (rounded > 99.99) rounded = 99.99;
+      const rounded = clampRate(Math.round(v * 10000) / 10000);
       q.push(rounded);
     }
     for (let k = 1; k < q.length; k++) {
