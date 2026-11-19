@@ -1,32 +1,33 @@
-# GTA VI trophy-rarity forecast
+# GTA VI Trophy Rarity Forecaster
 
-Forecasts each Grand Theft Auto VI (PS5) trophy's earn rate on Exophase at
-the case target, as five quantiles (5/25/50/75/95%) per trophy.
+Forecasts how many GTA VI players will have earned each of the 55 trophies
+by a target date, as five quantiles (5% / 25% / 50% / 75% / 95%) of the
+percentage of tracked players.
 
 ## Model
 
-Short-window logit-linear ensemble. Each trophy's earn rate is tracked in
-logit space against u = ln(1 + h), h hours since 2026-11-19T00:00:00Z.
-The median is the mean of least-squares lines fitted over the last 6 and
-12 hours of reads — a short window, because logit(rate) is concave in u and
-a long window averages in the early dilution phase, when the tracked-player
-base grew faster than earners and rates fell even as players progressed.
-The spread widens honestly when the models disagree: two extra candidate
-medians (linear on 24h, curvature-capped quadratic on 48h) give a range,
-and s = sqrt(0.45^2 + (0.5*range)^2), clipped to [0.30, 2.5]. Trophies
-nobody has earned yet get s = 2.0 so the upper quantiles cover a late
-breakthrough. The story chain (Ch1 >= Ch2 >= Ch3 >= Ch4 >= final mission
->= 100% >= Platinum) is enforced on the medians by isotonic regression,
-and a frozen launch-night prefix (reads identical to the first) is dropped
-when at least 10 reads remain. On a 14-scenario synthetic backtest this
-scored mean pinball loss 0.183, against 0.293 for the house curve baseline
-and 1.122 for persistence.
+Each trophy's rarity is modelled in logit space against log-hours since
+launch, because rarity growth saturates: early on the tracked-player base
+grows faster than earners (so rates fall), then progression takes over and
+rates rise. The median forecast is the average of two straight-line fits of
+logit(rarity) over the most recent 6 and 12 hours of reads — short windows
+track the current, flatter slope instead of averaging in the steep early
+phase. The spread around the median reflects how much four candidate
+forecasts (6h, 12h and 24h linear fits, plus a 48h quadratic with
+non-positive curvature) disagree. Chapter trophies are kept in story order
+(Chapter 1 ≥ Chapter 2 ≥ … ≥ Platinum) and a frozen launch-night run of
+identical reads is dropped when enough live reads remain. Trophies nobody
+has earned yet get a wide spread so the upper quantiles can cover a late
+breakthrough.
+
+On a 14-scenario synthetic backtest this model scored a mean pinball loss
+of 0.183, against 0.293 for the house curve baseline.
 
 ## Run
 
 ```sh
-MAKEFUN_INPUT_DIR=<input dir> MAKEFUN_OUTPUT_DIR=<output dir> node main.ts
+MAKEFUN_INPUT_DIR=./input MAKEFUN_OUTPUT_DIR=./output node main.ts
 ```
 
-Reads every `*.in` in the input dir and writes one `*.out` per case.
-Node 22, standard library only, deterministic.
+Reads every `*.in` in the input directory and writes one `*.out` per case.
+Node 22+, standard library only, deterministic.

@@ -1,44 +1,34 @@
-// gta6-trophy-rarity-forecast-01 — forecast each GTA VI trophy's Exophase earn
-// rate at the case target, as five quantiles per trophy.
+// GTA VI trophy rarity forecaster — gta6-trophy-rarity-forecast-01.
 //
-// Model (short-window logit-linear ensemble, see MODEL_SPEC.md):
-//   * Work in u = ln(1 + h), h = hours since 2026-11-19T00:00:00Z, and fit
-//     logit(rate) as a linear function of u over SHORT recent windows.
-//     logit(rate) is concave in u, so a short window tracks the current
-//     (flatter) slope instead of averaging in the early steep dilution phase.
-//   * Median logit = mean of the linear fits on the last 6h and last 12h of
-//     reads, evaluated at the target. A window with < 3 points falls back to
-//     the last observed logit rate.
-//   * Spread: two more candidate medians (linear on the last 24h, and a
-//     quadratic with curvature constrained <= 0 on the last 48h) measure
-//     disagreement; s = sqrt(0.45^2 + (0.5 * range)^2), clipped to
-//     [0.30, 2.5]. Trophies nobody has earned yet (max observed rate
-//     <= 0.011%) get s = 2.0 so the upper quantiles cover a late breakthrough.
-//   * Story-chain nesting: Ch1 >= Ch2 >= Ch3 >= Ch4 >= final mission >=
-//     100% Completion >= Platinum on the medians (isotonic regression).
-//   * Frozen-prefix handling: drop the leading run of reads identical to the
-//     first read when >= 10 reads remain; otherwise keep everything (a fully
-//     frozen history then forecasts as a persistence median).
-//   * Quantiles: logistic(logit(median) + z_tau * s), z the standard-normal
-//     quantiles, rounded to 4 decimals, clamped to [0.01, 99.99].
+// Forecasts, for each of the 55 trophies, the percentage of tracked players
+// who will have earned it by the case's target time, as five quantiles
+// (0.05 / 0.25 / 0.5 / 0.75 / 0.95).
 //
-// Deterministic: no randomness, no clock, no network. Node 22 stdlib only.
+// Model: short-window logit-linear ensemble. Each trophy's rarity is tracked
+// in logit space against u = ln(1 + hours since launch). The median is the
+// average of two ordinary-least-squares lines fitted over the last 6 and 12
+// hours of reads; the spread comes from how much four candidate medians
+// (6h, 12h, 24h linear fits plus a 48h quadratic) disagree. A story-chain
+// constraint keeps chapter trophies ordered, and a frozen launch-night
+// prefix (identical reads) is dropped when enough live reads remain.
 
-import * as fs from "node:fs";
-import * as path from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
+// Hours are measured from the start of launch day, 2026-11-19 00:00 UTC.
 const EPOCH_MS = Date.parse("2026-11-19T00:00:00Z");
 const MS_PER_HOUR = 3600000;
 
-// Standard-normal quantiles at 0.05 / 0.25 / 0.5 / 0.75 / 0.95.
-const Z = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
-// Story chain, trophy ids: Ch1, Ch2, Ch3, Ch4, final mission, 100%, platinum.
+// Normal-quantile z-scores for the five requested levels (exact values:
+// the 0.05/0.95 and 0.25/0.75 quantiles of the standard normal).
+const Z_VALUES = [-1.6448536269514722, -0.6744897501960817, 0, 0.6744897501960817, 1.6448536269514722];
+
+// The story chain: you cannot earn a later chapter without the earlier one,
+// and the platinum requires everything. Medians must not increase along it.
 const CHAIN_IDS = [3, 4, 5, 6, 7, 14, 1];
-const BASE_SPREAD = 0.45;
-const MIN_SPREAD = 0.3;
-const MAX_SPREAD = 2.5;
-const ZERO_RATE_SPREAD = 2.0;
-const ZERO_RATE_MAX = 0.011;
+
+const RATE_MIN = 0.01;
+const RATE_MAX = 99.99;
 
 interface TrophyDef {
   id: number;
@@ -47,283 +37,307 @@ interface TrophyDef {
 interface HistoryRead {
   slot: string;
   players_tracked: number;
-  rates: (number | null)[];
+  rates: number[];
 }
 
-interface CaseFile {
+interface CaseInput {
   at: string;
   target: string;
   trophies: TrophyDef[];
   history: HistoryRead[];
 }
 
-interface Read {
-  ms: number;
-  playersTracked: number;
-  rates: (number | null)[];
-}
-
-interface FitPoint {
+interface Point {
   u: number;
   y: number;
 }
 
+interface LineFit {
+  intercept: number;
+  slope: number;
+}
+
+interface QuadFit {
+  a: number;
+  b: number;
+  c: number;
+}
+
 function clampRate(rate: number): number {
-  if (rate < 0.01) return 0.01;
-  if (rate > 99.99) return 99.99;
+  if (rate < RATE_MIN) return RATE_MIN;
+  if (rate > RATE_MAX) return RATE_MAX;
   return rate;
 }
 
-function logitOf(ratePct: number): number {
-  const p = clampRate(ratePct);
-  return Math.log(p / (100 - p));
+function clampSpread(s: number): number {
+  if (s < 0.3) return 0.3;
+  if (s > 2.5) return 2.5;
+  return s;
 }
 
-function logistic(logit: number): number {
-  return 100 / (1 + Math.exp(-logit));
+function logit(rate: number): number {
+  const r = clampRate(rate);
+  return Math.log(r / (100 - r));
 }
 
-// Transformed time: u = ln(1 + h), h hours since the release-day epoch.
-function uOf(ms: number): number {
-  return Math.log(1 + (ms - EPOCH_MS) / MS_PER_HOUR);
+function logistic(x: number): number {
+  return 100 / (1 + Math.exp(-x));
 }
 
-// Ordinary least squares of y on u; value of the fitted line at uTarget.
-// Returns null when there are fewer than 3 points.
-function fitLine(points: FitPoint[], uTarget: number): number | null {
-  const n = points.length;
-  if (n < 3) return null;
-  let sx = 0;
-  let sy = 0;
-  let sxx = 0;
-  let sxy = 0;
-  for (const pt of points) {
-    sx += pt.u;
-    sy += pt.y;
-    sxx += pt.u * pt.u;
-    sxy += pt.u * pt.y;
-  }
-  const denom = n * sxx - sx * sx;
-  if (Math.abs(denom) < 1e-12) return sy / n;
-  const slope = (n * sxy - sx * sy) / denom;
-  const intercept = (sy - slope * sx) / n;
-  return intercept + slope * uTarget;
+function hoursSinceEpoch(ms: number): number {
+  return (ms - EPOCH_MS) / MS_PER_HOUR;
 }
 
-// Solve a 3x3 linear system by Gaussian elimination with partial pivoting.
-// Returns null when the system is (near-)singular.
-function solve3(a: number[][], b: number[]): number[] | null {
-  const m: number[][] = [
-    [a[0][0], a[0][1], a[0][2], b[0]],
-    [a[1][0], a[1][1], a[1][2], b[1]],
-    [a[2][0], a[2][1], a[2][2], b[2]],
-  ];
-  for (let col = 0; col < 3; col++) {
-    let pivot = col;
-    for (let row = col + 1; row < 3; row++) {
-      if (Math.abs(m[row][col]) > Math.abs(m[pivot][col])) pivot = row;
-    }
-    if (Math.abs(m[pivot][col]) < 1e-12) return null;
-    if (pivot !== col) {
-      const tmp = m[col];
-      m[col] = m[pivot];
-      m[pivot] = tmp;
-    }
-    for (let row = col + 1; row < 3; row++) {
-      const factor = m[row][col] / m[col][col];
-      for (let k = col; k < 4; k++) m[row][k] -= factor * m[col][k];
-    }
-  }
-  const x: number[] = [0, 0, 0];
-  for (let row = 2; row >= 0; row--) {
-    let sum = m[row][3];
-    for (let k = row + 1; k < 3; k++) sum -= m[row][k] * x[k];
-    x[row] = sum / m[row][row];
-  }
-  return x;
+// Transformed time coordinate: log-hours since launch.
+function uOf(slotMs: number): number {
+  return Math.log(1 + hoursSinceEpoch(slotMs));
 }
 
-// Quadratic least-squares fit of y on u (basis 1, u, u^2), value at uTarget.
-// Curvature is constrained to <= 0: a positive quadratic coefficient falls
-// back to the linear fit. Returns null when there are fewer than 3 points.
-function fitQuad(points: FitPoint[], uTarget: number): number | null {
-  const n = points.length;
-  if (n < 3) return null;
-  let s0 = 0;
-  let s1 = 0;
-  let s2 = 0;
-  let s3 = 0;
-  let s4 = 0;
-  let t0 = 0;
-  let t1 = 0;
-  let t2 = 0;
-  for (const pt of points) {
-    const u = pt.u;
-    const u2 = u * u;
-    s0 += 1;
-    s1 += u;
-    s2 += u2;
-    s3 += u2 * u;
-    s4 += u2 * u2;
-    t0 += pt.y;
-    t1 += u * pt.y;
-    t2 += u2 * pt.y;
-  }
-  const coef = solve3(
-    [
-      [s0, s1, s2],
-      [s1, s2, s3],
-      [s2, s3, s4],
-    ],
-    [t0, t1, t2],
-  );
-  if (coef === null) return fitLine(points, uTarget);
-  if (coef[2] > 0) return fitLine(points, uTarget);
-  return coef[0] + coef[1] * uTarget + coef[2] * uTarget * uTarget;
+function round4(x: number): number {
+  return Math.round(x * 10000) / 10000;
 }
 
-// Pool-adjacent-violators for a non-increasing sequence (equal weights).
-// Returns the adjusted values, same length and order as the input.
-function isotonicDecreasing(values: number[]): number[] {
-  interface Pool {
-    sum: number;
-    count: number;
-  }
-  const pools: Pool[] = [];
-  for (const v of values) {
-    pools.push({ sum: v, count: 1 });
-    while (pools.length >= 2) {
-      const n = pools.length;
-      const a = pools[n - 2];
-      const b = pools[n - 1];
-      if (a.sum / a.count >= b.sum / b.count) break;
-      pools.pop();
-      pools.pop();
-      pools.push({ sum: a.sum + b.sum, count: a.count + b.count });
-    }
-  }
-  const out: number[] = [];
-  for (const p of pools) {
-    const avg = p.sum / p.count;
-    for (let k = 0; k < p.count; k++) out.push(avg);
-  }
-  return out;
-}
-
-function sameRead(a: Read, b: Read): boolean {
-  if (a.playersTracked !== b.playersTracked) return false;
-  if (a.rates.length !== b.rates.length) return false;
-  for (let i = 0; i < a.rates.length; i++) {
-    if (a.rates[i] !== b.rates[i]) return false;
+function sameRates(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
   }
   return true;
 }
 
-function forecastCase(kase: CaseFile): { trophies: { id: number; q: number[] }[] } {
-  const atMs = Date.parse(kase.at);
-  const uTarget = uOf(Date.parse(kase.target));
+// Ordinary least squares line through the points; null when the fit is
+// degenerate (fewer than 3 points, or no spread in u).
+function linearFit(points: Point[]): LineFit | null {
+  if (points.length < 3) return null;
+  let sumU = 0;
+  let sumY = 0;
+  for (const p of points) {
+    sumU += p.u;
+    sumY += p.y;
+  }
+  const meanU = sumU / points.length;
+  const meanY = sumY / points.length;
+  let sxx = 0;
+  let sxy = 0;
+  for (const p of points) {
+    const du = p.u - meanU;
+    sxx += du * du;
+    sxy += du * (p.y - meanY);
+  }
+  if (sxx === 0) return null;
+  const slope = sxy / sxx;
+  return { intercept: meanY - slope * meanU, slope };
+}
 
-  const allReads: Read[] = [];
-  for (const h of kase.history) {
-    // A read's time is its clock slot: the house reads on a fixed clock and
-    // the slot is the read's canonical time (its `at` is the same instant
-    // plus sub-second jitter).
-    allReads.push({
-      ms: Date.parse(h.slot),
-      playersTracked: h.players_tracked,
-      rates: h.rates,
-    });
+// Quadratic fit y = a + b*u + c*u^2 via the normal equations; null when the
+// system is singular.
+function quadraticFit(points: Point[]): QuadFit | null {
+  if (points.length < 3) return null;
+  let n = 0;
+  let su = 0;
+  let su2 = 0;
+  let su3 = 0;
+  let su4 = 0;
+  let sy = 0;
+  let suy = 0;
+  let su2y = 0;
+  for (const p of points) {
+    const u = p.u;
+    const u2 = u * u;
+    n += 1;
+    su += u;
+    su2 += u2;
+    su3 += u2 * u;
+    su4 += u2 * u2;
+    sy += p.y;
+    suy += u * p.y;
+    su2y += u2 * p.y;
+  }
+  // Solve the 3x3 system by Gaussian elimination with partial pivoting.
+  const rows: number[][] = [
+    [n, su, su2, sy],
+    [su, su2, su3, suy],
+    [su2, su3, su4, su2y],
+  ];
+  for (let col = 0; col < 3; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < 3; r++) {
+      if (Math.abs(rows[r][col]) > Math.abs(rows[pivot][col])) pivot = r;
+    }
+    if (Math.abs(rows[pivot][col]) < 1e-12) return null;
+    if (pivot !== col) {
+      const tmp = rows[col];
+      rows[col] = rows[pivot];
+      rows[pivot] = tmp;
+    }
+    for (let r = col + 1; r < 3; r++) {
+      const factor = rows[r][col] / rows[col][col];
+      for (let k = col; k < 4; k++) {
+        rows[r][k] -= factor * rows[col][k];
+      }
+    }
+  }
+  const c = rows[2][3] / rows[2][2];
+  const b = (rows[1][3] - rows[1][2] * c) / rows[1][1];
+  const a = (rows[0][3] - rows[0][1] * b - rows[0][2] * c) / rows[0][0];
+  return { a, b, c };
+}
+
+// Candidate median from one window: linear fit evaluated at uTarget, or the
+// last observed logit when the window is too thin to fit.
+function linearCandidate(points: Point[], uTarget: number, lastLogit: number): number {
+  const fit = linearFit(points);
+  if (fit === null) return lastLogit;
+  return fit.intercept + fit.slope * uTarget;
+}
+
+// Candidate median from the 48h window: a quadratic, but only when its
+// curvature is non-positive (rates saturate, they do not accelerate); a
+// positively curved quadratic falls back to the linear fit.
+function quadCandidate(points: Point[], uTarget: number, lastLogit: number): number {
+  const fit = quadraticFit(points);
+  if (fit !== null && fit.c <= 0) {
+    return fit.a + fit.b * uTarget + fit.c * uTarget * uTarget;
+  }
+  return linearCandidate(points, uTarget, lastLogit);
+}
+
+// Pool-adjacent-violators for a decreasing sequence: scan the values,
+// keeping blocks of consecutive entries that share one average; whenever a
+// block's average rises above the previous block's, merge the two blocks
+// and re-average the whole merged block. The result is non-increasing.
+function enforceDecreasing(values: number[]): number[] {
+  interface Block {
+    start: number;
+    end: number;
+    sum: number;
+    count: number;
+  }
+  const blocks: Block[] = [];
+  for (let i = 0; i < values.length; i++) {
+    blocks.push({ start: i, end: i, sum: values[i], count: 1 });
+    while (blocks.length > 1) {
+      const cur = blocks[blocks.length - 1];
+      const prev = blocks[blocks.length - 2];
+      if (prev.sum / prev.count < cur.sum / cur.count) {
+        blocks.pop();
+        blocks.pop();
+        blocks.push({
+          start: prev.start,
+          end: cur.end,
+          sum: prev.sum + cur.sum,
+          count: prev.count + cur.count,
+        });
+      } else {
+        break;
+      }
+    }
+  }
+  const out = values.slice();
+  for (const b of blocks) {
+    const avg = b.sum / b.count;
+    for (let i = b.start; i <= b.end; i++) out[i] = avg;
+  }
+  return out;
+}
+
+function forecastCase(input: CaseInput): { trophies: { id: number; q: number[] }[] } {
+  const atMs = Date.parse(input.at);
+  const targetMs = Date.parse(input.target);
+  const uTarget = Math.log(1 + hoursSinceEpoch(targetMs));
+
+  // Drop the frozen launch-night prefix: the leading run of reads identical
+  // to the first one, but only when at least 10 live reads remain afterwards.
+  let reads = input.history;
+  if (reads.length > 0) {
+    const first = reads[0];
+    let drop = 0;
+    while (drop < reads.length) {
+      const r = reads[drop];
+      if (r.players_tracked !== first.players_tracked) break;
+      if (!sameRates(r.rates, first.rates)) break;
+      drop += 1;
+    }
+    if (reads.length - drop >= 10) {
+      reads = reads.slice(drop);
+    }
   }
 
-  // Frozen-prefix handling: drop the leading run identical to the first read
-  // when at least 10 reads remain afterwards; otherwise keep everything.
-  let reads = allReads;
-  if (allReads.length > 0) {
-    let run = 0;
-    while (run < allReads.length && sameRead(allReads[run], allReads[0])) run++;
-    if (allReads.length - run >= 10) reads = allReads.slice(run);
-  }
-
-  const trophyCount = kase.trophies.length;
-  const medians: number[] = [];
+  const trophyCount = input.trophies.length;
+  const medianLogits: number[] = [];
   const spreads: number[] = [];
+  const medianRates: number[] = [];
 
-  for (let i = 0; i < trophyCount; i++) {
-    // Observed (time, rate) pairs for this trophy, in chronological order.
-    const obs: { ms: number; rate: number }[] = [];
-    for (const r of reads) {
-      const rate = r.rates[i];
-      if (rate !== null && rate !== undefined) obs.push({ ms: r.ms, rate });
-    }
-
-    let lastLogit = 0;
+  for (let t = 0; t < trophyCount; t++) {
+    const series: Point[] = [];
     let maxRate = 0;
-    if (obs.length > 0) {
-      lastLogit = logitOf(obs[obs.length - 1].rate);
-      for (const o of obs) {
-        if (o.rate > maxRate) maxRate = o.rate;
-      }
+    for (const read of reads) {
+      const rate = read.rates[t];
+      if (rate > maxRate) maxRate = rate;
+      series.push({ u: uOf(Date.parse(read.slot)), y: logit(rate) });
     }
+    const lastLogit = series.length > 0 ? series[series.length - 1].y : logit(RATE_MIN);
 
-    const windows: FitPoint[][] = [[], [], [], []];
-    const windowHours = [6, 12, 24, 48];
-    for (const o of obs) {
-      const ageHours = (atMs - o.ms) / MS_PER_HOUR;
-      const pt: FitPoint = { u: uOf(o.ms), y: logitOf(o.rate) };
-      for (let w = 0; w < 4; w++) {
-        if (ageHours <= windowHours[w]) windows[w].push(pt);
+    const window = (hours: number): Point[] => {
+      const cutoff = atMs - hours * MS_PER_HOUR;
+      const out: Point[] = [];
+      for (let i = 0; i < reads.length; i++) {
+        if (Date.parse(reads[i].slot) >= cutoff) out.push(series[i]);
       }
-    }
+      return out;
+    };
 
-    const m6 = fitLine(windows[0], uTarget);
-    const m12 = fitLine(windows[1], uTarget);
-    const m24 = fitLine(windows[2], uTarget);
-    const m48 = fitQuad(windows[3], uTarget);
-    const c6 = m6 === null ? lastLogit : m6;
-    const c12 = m12 === null ? lastLogit : m12;
-    const c24 = m24 === null ? lastLogit : m24;
-    const c48 = m48 === null ? lastLogit : m48;
+    const m6 = linearCandidate(window(6), uTarget, lastLogit);
+    const m12 = linearCandidate(window(12), uTarget, lastLogit);
+    const m24 = linearCandidate(window(24), uTarget, lastLogit);
+    const m48 = quadCandidate(window(48), uTarget, lastLogit);
 
-    const medianLogit = (c6 + c12) / 2;
-    medians.push(clampRate(logistic(medianLogit)));
+    const medianLogit = (m6 + m12) / 2;
+    const range = Math.max(m6, m12, m24, m48) - Math.min(m6, m12, m24, m48);
+    let s = clampSpread(Math.sqrt(0.45 * 0.45 + Math.pow(0.5 * range, 2)));
+    // No one has earned this trophy yet: no signal at all, so widen the
+    // spread enough for the upper quantiles to cover a late breakthrough.
+    if (maxRate <= 0.011) s = 2.0;
 
-    const range = Math.max(c6, c12, c24, c48) - Math.min(c6, c12, c24, c48);
-    let s = Math.sqrt(BASE_SPREAD * BASE_SPREAD + (0.5 * range) * (0.5 * range));
-    if (s < MIN_SPREAD) s = MIN_SPREAD;
-    if (s > MAX_SPREAD) s = MAX_SPREAD;
-    if (maxRate <= ZERO_RATE_MAX) s = ZERO_RATE_SPREAD;
+    // The median rate is clamped to the observable range first, and the
+    // quantiles are built from the logit of that clamped median — a raw
+    // extrapolated logit past the cap must not leak into the quantiles.
+    const medianRate = clampRate(logistic(medianLogit));
+    medianLogits.push(logit(medianRate));
     spreads.push(s);
+    medianRates.push(medianRate);
   }
 
-  // Story-chain nesting on the medians (ids 3,4,5,6,7,14,1).
-  const indexById = new Map<number, number>();
-  for (let i = 0; i < trophyCount; i++) indexById.set(kase.trophies[i].id, i);
-  const chainIdx: number[] = [];
+  // Enforce the story chain on the medians.
+  const chainPositions: number[] = [];
+  const chainValues: number[] = [];
   for (const id of CHAIN_IDS) {
-    const idx = indexById.get(id);
-    if (idx !== undefined) chainIdx.push(idx);
+    const pos = input.trophies.findIndex((tr) => tr.id === id);
+    if (pos >= 0) {
+      chainPositions.push(pos);
+      chainValues.push(medianRates[pos]);
+    }
   }
-  if (chainIdx.length > 1) {
-    const chainValues: number[] = [];
-    for (const idx of chainIdx) chainValues.push(medians[idx]);
-    const adjusted = isotonicDecreasing(chainValues);
-    for (let k = 0; k < chainIdx.length; k++) medians[chainIdx[k]] = adjusted[k];
+  if (chainValues.length > 1) {
+    const fixed = enforceDecreasing(chainValues);
+    for (let k = 0; k < chainPositions.length; k++) {
+      const pos = chainPositions[k];
+      medianRates[pos] = fixed[k];
+      medianLogits[pos] = logit(fixed[k]);
+    }
   }
 
   const rows: { id: number; q: number[] }[] = [];
-  for (let i = 0; i < trophyCount; i++) {
-    const medLogit = logitOf(medians[i]);
-    const s = spreads[i];
-    const q: number[] = [];
-    for (const z of Z) {
-      const v = logistic(medLogit + z * s);
-      const rounded = clampRate(Math.round(v * 10000) / 10000);
-      q.push(rounded);
+  for (let t = 0; t < trophyCount; t++) {
+    const qs: number[] = [];
+    for (let k = 0; k < Z_VALUES.length; k++) {
+      qs.push(clampRate(round4(logistic(medianLogits[t] + Z_VALUES[k] * spreads[t]))));
     }
-    for (let k = 1; k < q.length; k++) {
-      if (q[k] < q[k - 1]) q[k] = q[k - 1];
+    // Enforce non-decreasing quantiles after rounding.
+    for (let k = 1; k < qs.length; k++) {
+      if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
     }
-    rows.push({ id: kase.trophies[i].id, q });
+    rows.push({ id: input.trophies[t].id, q: qs });
   }
   return { trophies: rows };
 }
@@ -331,14 +345,13 @@ function forecastCase(kase: CaseFile): { trophies: { id: number; q: number[] }[]
 function main(): void {
   const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input";
   const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-  fs.mkdirSync(outputDir, { recursive: true });
-  const names = fs.readdirSync(inputDir).filter((n) => n.endsWith(".in")).sort();
-  for (const name of names) {
-    const raw = fs.readFileSync(path.join(inputDir, name), "utf8");
-    const kase: CaseFile = JSON.parse(raw);
-    const out = forecastCase(kase);
-    const outName = name.slice(0, -3) + ".out";
-    fs.writeFileSync(path.join(outputDir, outName), JSON.stringify(out));
+  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
+  const files = readdirSync(inputDir).filter((f) => f.endsWith(".in")).sort();
+  for (const file of files) {
+    const input = JSON.parse(readFileSync(join(inputDir, file), "utf8"));
+    const result = forecastCase(input);
+    const outName = file.slice(0, -3) + ".out";
+    writeFileSync(join(outputDir, outName), JSON.stringify(result));
   }
 }
 
