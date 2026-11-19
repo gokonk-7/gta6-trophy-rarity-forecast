@@ -27,6 +27,10 @@ const Z_VALUES = [-1.6448536269514722, -0.6744897501960817, 0, 0.674489750196081
 // and the platinum requires everything. Medians must not increase along it.
 const CHAIN_IDS = [3, 4, 5, 6, 7, 14, 1];
 
+// Calibrated forecast-error scale (in logits) for a 4.46-day horizon:
+// the base spread every trophy gets before model disagreement widens it.
+const BASE_SPREAD = 0.45;
+
 const RATE_MIN = 0.01;
 const RATE_MAX = 99.99;
 
@@ -294,7 +298,7 @@ function forecastCase(input: CaseInput): { trophies: { id: number; q: number[] }
 
     const medianLogit = (m6 + m12) / 2;
     const range = Math.max(m6, m12, m24, m48) - Math.min(m6, m12, m24, m48);
-    let s = clampSpread(Math.sqrt(0.45 * 0.45 + Math.pow(0.5 * range, 2)));
+    let s = clampSpread(Math.sqrt(BASE_SPREAD * BASE_SPREAD + Math.pow(0.5 * range, 2)));
     // No one has earned this trophy yet: no signal at all, so widen the
     // spread enough for the upper quantiles to cover a late breakthrough.
     if (maxRate <= 0.011) s = 2.0;
